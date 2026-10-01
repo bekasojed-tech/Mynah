@@ -200,12 +200,11 @@ class TestMigrationWithKeyring:
         cfg = config_module.Config.load()
 
         assert cfg.hf_token == "hf_legacy"
+        assert cfg.discord_client_secret == "legacy-secret"
         assert store[(secrets_store.SERVICE_NAME, "huggingface-token")] == "hf_legacy"
-        # PKCE (issue #1): a legacy plaintext Client Secret is DROPPED,
-        # not migrated — the OAuth flow no longer uses one.
         assert (
             secrets_store.SERVICE_NAME, "discord-client-secret",
-        ) not in store
+        ) in store
 
         on_disk = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
         assert "discord_client_secret" not in on_disk
@@ -360,8 +359,8 @@ class TestShadowFieldsV27:
     def test_shadow_fields_includes_all_legacy_shadows(
         self, config_module,
     ) -> None:
-        # _legacy_client_secret was removed in the PKCE migration (#1).
         assert config_module._SHADOW_FIELDS == frozenset({
+            "_legacy_client_secret",
             "_legacy_hf_token",
             "_legacy_token",
         })
@@ -496,11 +495,10 @@ class TestMigrationFallbackWhenKeyringUnavailable:
 
         # And the on-disk JSON still carries it, because keyring
         # storage isn't available on this install. This is the
-        # documented graceful-fallback path. The legacy Client Secret
-        # is gone either way — PKCE needs no secret (#1).
+        # documented graceful-fallback path.
         cfg.save()
         on_disk = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
-        assert "discord_client_secret" not in on_disk
+        assert on_disk["discord_client_secret"] == "legacy-secret"
         assert on_disk["hf_token"] == "hf_legacy"
 
 

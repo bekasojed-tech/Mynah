@@ -38,6 +38,7 @@ from .recorder import RecordingResult, RecordingSession
 from .rpc import DiscordRPC
 from .uicore import (
     CONSENT_DIALOG_TEXT,
+    _AUTH_MODE_LABELS,
     _scrub,
     apply_settings_atomically,
     build_consent_record,
@@ -209,8 +210,8 @@ class MynahBackend:
                 log.error(
                     "PyAudioWPatch missing — install with: pip install PyAudioWPatch"
                 )
-            if not self._config.discord_client_id:
-                log.warning("Discord Client ID not configured. Open Settings.")
+            if not self._config.discord_is_configured():
+                log.warning("Discord Client ID/Secret not configured. Open Settings.")
             self._emit_state()
 
         threading.Thread(target=probe, daemon=True, name="env-check").start()
@@ -481,7 +482,8 @@ class MynahBackend:
         with self._lock:
             return {
                 "version": __version__,
-                "configured": bool(self._config.discord_client_id),
+                "configured": self._config.discord_is_configured(),
+                "authMode": self._config.discord_auth_mode,
                 "whisperxAvailable": self._whisperx_available,
                 "connected": self._rpc is not None,
                 "connecting": self._connecting,
@@ -509,13 +511,15 @@ class MynahBackend:
         with self._lock:
             if self._connecting or self._rpc is not None:
                 return {"ok": False, "error": "Already connected or connecting."}
-            if not self._config.discord_client_id:
+            if not self._config.discord_is_configured():
                 return {"ok": False, "error": "not_configured"}
             self._connecting = True
             self._rpc_error = ""
             self._status = "Connecting to Discord…"
 
+        use_streamkit = self._config.uses_streamkit
         client_id = self._config.discord_client_id
+        client_secret = self._config.discord_client_secret
         existing_token = asdict(self._config.token) if self._config.token else None
 
         def worker() -> None:
@@ -523,7 +527,10 @@ class MynahBackend:
                 # Build the RPC instance locally; only publish to self._rpc
                 # after connect() succeeds, so other calls can't observe a
                 # half-initialised DiscordRPC during the connect window.
-                rpc = DiscordRPC(client_id)
+                if use_streamkit:
+                    rpc = DiscordRPC.for_streamkit()
+                else:
+                    rpc = DiscordRPC(client_id, client_secret)
                 new_token = rpc.connect(existing_token=existing_token)
             except BaseException as e:  # noqa: BLE001
                 log.exception("RPC connect failed")
@@ -785,7 +792,9 @@ class MynahBackend:
             loopback_devices = []
         return {
             "values": {
+                "discord_auth_mode": c.discord_auth_mode,
                 "discord_client_id": c.discord_client_id,
+                "discord_client_secret": c.discord_client_secret,
                 "hf_token": c.hf_token,
                 "whisper_model": c.whisper_model,
                 "audio_source": c.audio_source,
@@ -794,6 +803,10 @@ class MynahBackend:
                 "check_updates": c.check_updates,
             },
             "options": {
+                "auth_modes": [
+                    {"value": k, "label": v}
+                    for k, v in _AUTH_MODE_LABELS.items()
+                ],
                 "whisper_models": _WHISPER_MODELS,
                 "audio_sources": [
                     {"value": k, "label": v}
@@ -807,7 +820,15 @@ class MynahBackend:
     def save_settings(self, values: dict) -> dict:
         c = self._config
         new_values = {
+            "discord_auth_mode": (
+                values.get("discord_auth_mode")
+                if values.get("discord_auth_mode") in _AUTH_MODE_LABELS
+                else c.discord_auth_mode
+            ),
             "discord_client_id": str(values.get("discord_client_id", "")).strip(),
+            "discord_client_secret": str(
+                values.get("discord_client_secret", "")
+            ).strip(),
             "hf_token": str(values.get("hf_token", "")).strip(),
             "whisper_model": (
                 str(values.get("whisper_model", "")).strip() or "large-v3-turbo"

@@ -284,6 +284,7 @@ class TestApplySettingsAtomically:
         class _Config:
             def __init__(self):
                 self.discord_client_id = "orig_id"
+                self.discord_client_secret = "orig_secret"
                 self._hf = existing_hf
                 self._token = MagicMock()
                 self.whisper_model = "large-v3-turbo"
@@ -319,6 +320,7 @@ class TestApplySettingsAtomically:
     def _new_values(self):
         return {
             "discord_client_id": "new_id",
+            "discord_client_secret": "new_secret",
             "hf_token": "new-hf",
             "whisper_model": "large-v3-turbo",
             "audio_source": "mixed",
@@ -361,6 +363,7 @@ class TestApplySettingsAtomically:
         class _Config:
             def __init__(self):
                 self.discord_client_id = "orig_id"
+                self.discord_client_secret = "orig_secret"
                 self._hf = "live-hf"
                 self._token = MagicMock()
                 self.whisper_model = "large-v3-turbo"
@@ -401,6 +404,7 @@ class TestApplySettingsAtomically:
         cfg = _Config()
         new_values = {
             "discord_client_id": "new_id",
+            "discord_client_secret": "new_secret",
             "hf_token": "new-hf",
             "whisper_model": "large-v3-turbo",
             "audio_source": "mixed",

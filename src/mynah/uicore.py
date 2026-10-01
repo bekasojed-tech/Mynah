@@ -16,7 +16,15 @@ from pathlib import Path
 from typing import Optional
 
 from . import secrets_store
-from .config import Config
+from .config import AUTH_MODE_OWN_APP, AUTH_MODE_STREAMKIT, Config
+
+# User-facing labels for the Discord identity selector, shared by the
+# WebView2 settings panel (backend.get_settings options) and the legacy
+# Tk dialog. Ordered: the recommended choice first.
+_AUTH_MODE_LABELS = {
+    AUTH_MODE_STREAMKIT: "Discord StreamKit identity (no app needed, recommended)",
+    AUTH_MODE_OWN_APP: "My own Discord application (Client ID + Secret)",
+}
 
 log = logging.getLogger(__name__)
 
@@ -109,10 +117,10 @@ def apply_settings_atomically(c: Config, new_values: dict):
     rollback semantics are unit-testable without instantiating a Tk
     Toplevel. The contract is:
 
-    - Snapshot the prior secret state (token, hf_token).
+    - Snapshot the prior secret state (client secret, token, hf_token).
     - Attempt the secret writes in this order: token (cleared if the
-      client_id changed — the cached OAuth token belongs to the old
-      application), hf_token. If any raises SecretWriteError, roll
+      Discord credentials changed — the cached OAuth token belongs to the old
+      application), client secret, hf_token. If any raises SecretWriteError, roll
       back the writes that already committed (best-effort: a rollback
       that itself raises is swallowed and logged) and return the
       original exception.
@@ -128,12 +136,22 @@ def apply_settings_atomically(c: Config, new_values: dict):
     NOT saved" while the in-memory config carried the new client_id,
     a deleted token, and a half-applied keyring state.
 
-    (The Discord Client Secret was removed from this contract in the
-    PKCE migration, issue #1.)
     """
     new_client_id = new_values["discord_client_id"]
+    new_client_secret = new_values["discord_client_secret"]
     new_hf_token = new_values["hf_token"]
-    credentials_changed = new_client_id != c.discord_client_id
+    orig_client_secret = c.discord_client_secret
+    # The auth mode decides which Discord application the cached OAuth
+    # token belongs to, so a mode switch invalidates the token exactly
+    # like a Client ID change does. Callers that predate the setting
+    # (and the fake configs in tests) may omit it: treat as unchanged.
+    orig_auth_mode = getattr(c, "discord_auth_mode", None)
+    new_auth_mode = new_values.get("discord_auth_mode", orig_auth_mode)
+    credentials_changed = (
+        new_client_id != c.discord_client_id
+        or new_client_secret != orig_client_secret
+        or new_auth_mode != orig_auth_mode
+    )
     orig_hf_token = c.hf_token
     orig_token = c.token
     secret_writes_committed: list[str] = []
@@ -141,6 +159,8 @@ def apply_settings_atomically(c: Config, new_values: dict):
         if credentials_changed:
             c.token = None
             secret_writes_committed.append("token")
+        c.discord_client_secret = new_client_secret
+        secret_writes_committed.append("client_secret")
         c.hf_token = new_hf_token
         secret_writes_committed.append("hf_token")
     except secrets_store.SecretWriteError as e:
@@ -148,6 +168,8 @@ def apply_settings_atomically(c: Config, new_values: dict):
             try:
                 if kind == "hf_token":
                     c.hf_token = orig_hf_token
+                elif kind == "client_secret":
+                    c.discord_client_secret = orig_client_secret
                 elif kind == "token" and orig_token is not None:
                     c.token = orig_token
             except secrets_store.SecretWriteError as rollback_err:
@@ -167,6 +189,8 @@ def apply_settings_atomically(c: Config, new_values: dict):
                 )
         return e
     c.discord_client_id = new_client_id
+    if new_auth_mode is not None:
+        c.discord_auth_mode = new_auth_mode
     c.whisper_model = new_values["whisper_model"]
     c.audio_source = new_values["audio_source"]
     c.recordings_dir = new_values["recordings_dir"]

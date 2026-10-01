@@ -4,6 +4,35 @@ All notable changes to Mynah are documented here.
 This project follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **StreamKit identity (default for new installs).** Discord now refuses
+  the `rpc` OAuth scope for ordinary developer applications
+  (`invalid_scope` before the Authorize prompt even appears), which made
+  "create your own application" setups unable to connect at all. Mynah
+  can instead authorize as Discord's own StreamKit Overlay application —
+  the same flow the official OBS browser-source overlay and third-party
+  overlays such as Discover use. No developer application, Client ID or
+  Client Secret is needed; the authorization code is exchanged at
+  `streamkit.discord.com`, so nothing goes to a third party. Settings
+  gained a **Connect as** selector; the previous own-application flow
+  remains available for users whose application Discord has approved.
+  Existing installs that already carry a Client ID stay on the
+  own-application flow until switched. StreamKit tokens cannot be
+  refreshed, so Discord re-prompts for authorization roughly weekly.
+
+### Fixed
+
+- Restored Discord's documented local-RPC OAuth contract. The RPC
+  `AUTHORIZE` command does not accept browser/Social-SDK PKCE or redirect
+  arguments; token exchange therefore uses the application's Client Secret,
+  stored in the OS credential manager rather than `config.json`.
+- Stop requesting the partner-only `rpc.voice.read` scope from ordinary
+  developer applications; Discord rejects it with `invalid_scope`. Base RPC
+  remains enabled and speaker-event tracking falls back to audio diarization.
+
 ## [1.3.0] — 2026-06-11
 
 ### Added

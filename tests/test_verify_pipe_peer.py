@@ -34,7 +34,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from mynah.rpc import DiscordRPC, RpcError
+from mynah.rpc import DiscordRPC, RpcError, _AUTHENTICODE_TIMEOUT_SEC
 
 
 SQUIRREL_PATH = r"C:\Users\u\AppData\Local\Discord\app-1.0.9051\Discord.exe"
@@ -153,7 +153,9 @@ class TestAuthenticodeVerification:
     def test_signature_check_timeout_fails_closed(self, monkeypatch):
         monkeypatch.setattr(
             subprocess, "run",
-            MagicMock(side_effect=subprocess.TimeoutExpired(cmd=["pwsh"], timeout=15)),
+            MagicMock(side_effect=subprocess.TimeoutExpired(
+                cmd=["pwsh"], timeout=_AUTHENTICODE_TIMEOUT_SEC,
+            )),
         )
         with pytest.raises(RpcError, match="timed out"):
             DiscordRPC._verify_authenticode_signed_by_discord(SQUIRREL_PATH, 1234)
@@ -182,7 +184,7 @@ class TestAuthenticodeVerification:
         assert "Get-AuthenticodeSignature" in script
         # The image path is single-quoted, single quotes inside are doubled.
         assert SQUIRREL_PATH in script
-        assert captured["kwargs"]["timeout"] == 15
+        assert captured["kwargs"]["timeout"] == _AUTHENTICODE_TIMEOUT_SEC
         assert captured["kwargs"]["capture_output"] is True
 
     def test_single_quote_in_path_escaped_for_powershell(self, monkeypatch):
