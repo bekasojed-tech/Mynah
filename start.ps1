@@ -294,7 +294,7 @@ except Exception as e:
     print(f'  ERROR: could not import mynah.config: {e}')
     sys.exit(1)
 
-keep = {'discord_client_id', 'recordings_dir', 'whisper_model', 'audio_source', 'loopback_device_name', 'check_updates'}
+keep = {'discord_client_id', 'discord_auth_mode', 'recordings_dir', 'whisper_model', 'audio_source', 'loopback_device_name', 'check_updates'}
 all_fields = {f.name for f in fields(Config)}
 
 unknown = keep - all_fields

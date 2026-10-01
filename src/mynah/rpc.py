@@ -27,12 +27,9 @@ pipe after a liveness timeout, which manifests as the recorder appearing to
 """
 from __future__ import annotations
 
-import base64
-import hashlib
 import json
 import logging
 import os
-import secrets
 import struct
 import threading
 import time
@@ -45,16 +42,83 @@ log = logging.getLogger(__name__)
 
 OAUTH_TOKEN_URL = "https://discord.com/api/oauth2/token"
 REDIRECT_URI = "http://localhost"
-SCOPES = ["rpc", "rpc.voice.read", "identify"]
+# Discord only grants rpc.voice.read to approved partners. Requesting it from
+# a normal developer application makes the entire AUTHORIZE operation fail
+# with invalid_scope. Base RPC still provides the selected-channel query; the
+# recorder gracefully falls back to audio diarization when speaking-event
+# subscriptions are unavailable.
+SCOPES = ["rpc", "identify"]
+
+# ---- StreamKit identity -----------------------------------------------------
+# Discord restricts the base `rpc` OAuth scope to applications it has
+# approved. A freshly created developer application is refused with
+# `invalid_scope` before the Authorize prompt even appears (verified
+# 2026-10-02), so the "bring your own application" flow above no longer
+# works for ordinary accounts.
+#
+# Discord's own StreamKit Overlay (the OBS/XSplit browser source) is an
+# approved RPC application. Its browser page authorizes against the local
+# RPC server with the client id below and exchanges the resulting code at
+# streamkit.discord.com, which holds the application secret server-side.
+# Third-party overlays (e.g. Discover Overlay on Linux) have driven the
+# same flow for years. In this mode Mynah needs no developer application,
+# no Client ID and no Client Secret.
+#
+# The scope list mirrors what StreamKit itself requests, so the request
+# looks exactly like the one Discord's own page sends. Mynah only ever
+# exercises the `rpc` part (GET_SELECTED_VOICE_CHANNEL and the SPEAKING_* /
+# VOICE_STATE_* subscriptions); the two read-only extras are never used.
+#
+# Trade-off: this presents Mynah to Discord under Discord's own
+# application identity. Discord tolerates the open-source overlays doing
+# this, but could stop honouring it at any time, and the only token
+# refresh available is a fresh Authorize prompt (roughly weekly).
+STREAMKIT_CLIENT_ID = "207646673902501888"
+STREAMKIT_TOKEN_URL = "https://streamkit.discord.com/overlay/token"
+STREAMKIT_SCOPES = ["rpc", "messages.read", "rpc.notifications.read"]
+# Discord user access tokens live seven days. Used only when AUTHENTICATE
+# does not report an explicit expiry for a StreamKit token.
+_STREAMKIT_TOKEN_LIFETIME_SEC = 7 * 24 * 3600
+
+AUTH_MODE_OWN_APP = "own_app"
+AUTH_MODE_STREAMKIT = "streamkit"
+AUTH_MODES = (AUTH_MODE_STREAMKIT, AUTH_MODE_OWN_APP)
 
 # Hard cap on a single IPC frame. Discord IPC payloads are JSON and are
 # always small in practice (kilobytes). Anything larger is a hostile peer or
 # a corrupted pipe and must be refused before we try to allocate.
 _MAX_FRAME_BYTES = 1 << 20  # 1 MiB
 
+# A cold Authenticode certificate-chain/revocation check can take well over
+# 15 seconds on Windows, especially while Defender or Windows Update is busy.
+# Keep verification fail-closed, but allow enough time for a legitimate
+# Discord signature check to complete on slower systems.
+_AUTHENTICODE_TIMEOUT_SEC = 60
+
 
 class RpcError(RuntimeError):
     pass
+
+
+def _parse_rpc_expiry(value: object) -> Optional[float]:
+    """Parse AUTHENTICATE's `expires` (ISO 8601, e.g.
+    "2026-10-09T12:34:56.789000+00:00" or "...Z") into a POSIX timestamp.
+    Returns None for anything unparseable — callers fall back to their
+    own estimate rather than failing the connect."""
+    if not isinstance(value, str) or not value:
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        from datetime import datetime, timezone
+
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
 
 
 class _PipeReadIdle(RpcError):
@@ -132,16 +196,29 @@ class DiscordRPC:
     PING = 3
     PONG = 4
 
-    def __init__(self, client_id: str):
-        if not client_id:
+    def __init__(
+        self,
+        client_id: str,
+        client_secret: str,
+        *,
+        auth_mode: str = AUTH_MODE_OWN_APP,
+    ):
+        if auth_mode not in AUTH_MODES:
+            raise RpcError(f"Unknown Discord auth mode {auth_mode!r}")
+        if auth_mode == AUTH_MODE_OWN_APP and not (client_id and client_secret):
             raise RpcError(
-                "Discord client_id is required. Create an application at "
-                "https://discord.com/developers/applications, enable "
-                "'Public Client' on its OAuth2 tab, and enter the Client ID "
-                "in Settings."
+                "Discord client_id and client_secret are required. Create an "
+                "application at https://discord.com/developers/applications "
+                "and enter both values in Settings."
             )
+        self.auth_mode = auth_mode
         self.client_id = client_id
+        self.client_secret = client_secret
         self.pipe = None
+        # Access-token expiry reported by AUTHENTICATE (`expires`, ISO 8601).
+        # StreamKit tokens have no refresh token, so this is the only
+        # authoritative lifetime we get for them.
+        self.token_expires_at: Optional[float] = None
         self.connected = False
         self.authenticated = False
         # Populated after a successful AUTHENTICATE — contains at minimum
@@ -522,7 +599,7 @@ class DiscordRPC:
                     "-Command", script,
                 ],
                 capture_output=True,
-                timeout=15,
+                timeout=_AUTHENTICODE_TIMEOUT_SEC,
             )
         except FileNotFoundError as e:
             log.error(
@@ -535,8 +612,8 @@ class DiscordRPC:
             ) from e
         except subprocess.TimeoutExpired as e:
             log.error(
-                "Authenticode verification of %r (PID %d) timed out after 15s.",
-                image_path, pid,
+                "Authenticode verification of %r (PID %d) timed out after %ds.",
+                image_path, pid, _AUTHENTICODE_TIMEOUT_SEC,
             )
             raise RpcError(
                 f"Refusing peer: signature verification of {image_path!r} timed out."
@@ -1057,6 +1134,11 @@ class DiscordRPC:
 
             token = self._authorize()
             self._authenticate(token["access_token"])
+            if not token.get("refresh_token") and self.token_expires_at:
+                # No refresh path (StreamKit): trust Discord's own expiry
+                # so the next connect() re-prompts exactly when needed
+                # instead of failing AUTHENTICATE on a stale token first.
+                token = dict(token, expires_at=self.token_expires_at)
             return token
         except BaseException:
             try:
@@ -1071,32 +1153,8 @@ class DiscordRPC:
             if self.authenticated:
                 self._start_reader()
 
-    @staticmethod
-    def _make_pkce_pair() -> tuple[str, str]:
-        """RFC 7636 code_verifier + S256 code_challenge.
-
-        token_urlsafe(64) yields ~86 chars from the unreserved set,
-        comfortably inside the spec's 43–128 char window. The challenge
-        is the base64url-encoded SHA-256 of the verifier with padding
-        stripped — the only method Discord supports is S256.
-        """
-        verifier = secrets.token_urlsafe(64)
-        challenge = (
-            base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("ascii")).digest())
-            .rstrip(b"=")
-            .decode("ascii")
-        )
-        return verifier, challenge
-
     def _post_token(self, form: dict, context: str) -> dict:
-        """POST to the OAuth token endpoint with a PKCE-aware error path.
-
-        A 401 `invalid_client` here almost always means the Discord
-        application doesn't have 'Public Client' enabled — without that
-        flag Discord refuses secret-less token exchange even when the
-        PKCE parameters are correct. Surface that as actionable text
-        instead of a bare HTTPError.
-        """
+        """POST to Discord's OAuth token endpoint with useful errors."""
         resp = requests.post(
             OAUTH_TOKEN_URL,
             data=form,
@@ -1110,58 +1168,75 @@ class DiscordRPC:
                 err = ""
             if err == "invalid_client":
                 raise RpcError(
-                    f"Discord rejected the {context} (invalid_client). "
-                    "Open your application's OAuth2 tab at "
-                    "https://discord.com/developers/applications and enable "
-                    "'Public Client', then try again."
+                    f"Discord rejected the {context} (invalid_client). Check "
+                    "the Client ID and Client Secret in Settings. If you reset "
+                    "the secret in the Developer Portal, save the new value."
                 )
         resp.raise_for_status()
         return resp.json()
 
+    @classmethod
+    def for_streamkit(cls) -> "DiscordRPC":
+        """Client that authorizes as Discord's StreamKit Overlay application.
+
+        No Client ID / Secret involved: the code from AUTHORIZE is exchanged
+        at streamkit.discord.com, exactly as the official overlay page does.
+        """
+        return cls(STREAMKIT_CLIENT_ID, "", auth_mode=AUTH_MODE_STREAMKIT)
+
+    @property
+    def scopes(self) -> list[str]:
+        if self.auth_mode == AUTH_MODE_STREAMKIT:
+            return list(STREAMKIT_SCOPES)
+        return list(SCOPES)
+
     def _authorize(self) -> dict:
         log.info("Requesting AUTHORIZE — accept the prompt in Discord")
-        # PKCE (RFC 7636) replaces the client_secret of the pre-1.1 flow:
-        # the token exchange below proves possession of the verifier whose
-        # hash Discord bound to the authorization code, so a stolen code
-        # is useless on its own (issue #1).
-        verifier, challenge = self._make_pkce_pair()
-        state = secrets.token_urlsafe(32)
-        data = self._cmd(
-            "AUTHORIZE",
-            {
-                "client_id": self.client_id,
-                "scopes": SCOPES,
-                "code_challenge": challenge,
-                "code_challenge_method": "S256",
-                "state": state,
-            },
-            timeout=120.0,
-        )
-        # Discord's RPC AUTHORIZE response is documented to return only
-        # {"code": ...} — it accepts `state` but does not currently echo
-        # it. Enforce the match strictly IF a state comes back (a wrong
-        # one is a code-substitution red flag), but tolerate absence:
-        # hard-requiring it would break every connect, and on a local
-        # pipe the PKCE verifier is what actually prevents an attacker
-        # from redeeming a substituted code.
-        echoed_state = data.get("state")
-        if echoed_state is not None and echoed_state != state:
-            raise RpcError(
-                "AUTHORIZE state mismatch (possible code-substitution "
-                "attack); refusing to exchange the code."
+        # The legacy local Discord RPC protocol has a deliberately small
+        # AUTHORIZE argument contract. In particular, redirect_uri, PKCE and
+        # state belong to browser/Social-SDK OAuth and are rejected here.
+        try:
+            data = self._cmd(
+                "AUTHORIZE",
+                {
+                    "client_id": self.client_id,
+                    "scopes": self.scopes,
+                },
+                timeout=120.0,
             )
+        except RpcError as e:
+            if "invalid_scope" in str(e).lower():
+                if self.auth_mode == AUTH_MODE_STREAMKIT:
+                    raise RpcError(
+                        "Discord denied the RPC scopes for the StreamKit "
+                        "identity. Discord may have changed what its "
+                        "StreamKit application is allowed to request; "
+                        "update Mynah or switch Settings to your own "
+                        "application."
+                    ) from e
+                raise RpcError(
+                    "Discord denied the restricted 'rpc' OAuth scope for "
+                    "this application. Discord must approve RPC access (or "
+                    "make the account an eligible app tester); this cannot "
+                    "be enabled by a Mynah setting. Switch Settings to the "
+                    "StreamKit identity to connect without your own "
+                    "application."
+                ) from e
+            raise
         code = data.get("code")
         if not code:
             raise RpcError("AUTHORIZE returned no code")
+        if self.auth_mode == AUTH_MODE_STREAMKIT:
+            return self._exchange_streamkit_code(code)
         body = self._post_token(
             {
                 "client_id": self.client_id,
+                "client_secret": self.client_secret,
                 "grant_type": "authorization_code",
                 "code": code,
                 "redirect_uri": REDIRECT_URI,
-                "code_verifier": verifier,
             },
-            context="PKCE token exchange",
+            context="OAuth token exchange",
         )
         try:
             return {
@@ -1172,12 +1247,54 @@ class DiscordRPC:
         except KeyError as e:
             raise RpcError(f"OAuth response missing required field {e!s}")
 
+    def _exchange_streamkit_code(self, code: str) -> dict:
+        """Trade an AUTHORIZE code for an access token via StreamKit.
+
+        StreamKit's endpoint returns only `{"access_token": ...}` — no
+        refresh token and no `expires_in`. The returned dict therefore
+        carries an empty refresh_token (connect() skips the refresh branch
+        and re-prompts when the token lapses) and a provisional expiry that
+        connect() tightens from AUTHENTICATE's `expires` field.
+        """
+        try:
+            resp = requests.post(
+                STREAMKIT_TOKEN_URL,
+                json={"code": code},
+                timeout=15,
+            )
+        except requests.RequestException as e:
+            raise RpcError(
+                f"Could not reach Discord's StreamKit token service: {e}"
+            ) from e
+        if resp.status_code != 200:
+            raise RpcError(
+                "Discord's StreamKit token service rejected the authorization "
+                f"code (HTTP {resp.status_code}). Try connecting again; if it "
+                "keeps failing, Discord may have changed the StreamKit flow."
+            )
+        try:
+            body = resp.json()
+        except ValueError as e:
+            raise RpcError("StreamKit token response was not JSON") from e
+        access_token = (body or {}).get("access_token") if isinstance(body, dict) else None
+        if not access_token:
+            raise RpcError("StreamKit token response missing access_token")
+        return {
+            "access_token": access_token,
+            "refresh_token": "",
+            "expires_at": time.time() + _STREAMKIT_TOKEN_LIFETIME_SEC,
+        }
+
     def _refresh_token(self, refresh_token: str) -> dict:
-        # Public-client refresh: client_id only, no secret. Requires the
-        # same 'Public Client' application flag as the code exchange.
+        if self.auth_mode == AUTH_MODE_STREAMKIT:
+            # StreamKit never hands out a refresh token; connect() only
+            # reaches here with a non-empty one if a token stored by the
+            # own-application mode leaked across a mode switch.
+            raise RpcError("StreamKit tokens cannot be refreshed; re-authorizing.")
         body = self._post_token(
             {
                 "client_id": self.client_id,
+                "client_secret": self.client_secret,
                 "grant_type": "refresh_token",
                 "refresh_token": refresh_token,
             },
@@ -1200,6 +1317,7 @@ class DiscordRPC:
         # `authenticated` as "identity is populated".
         if not user.get("id"):
             raise RpcError("AUTHENTICATE returned no user identity")
+        self.token_expires_at = _parse_rpc_expiry((data or {}).get("expires"))
         self.identity = {
             "id": user.get("id"),
             "username": user.get("username"),

@@ -127,33 +127,60 @@ dev launcher.
 ## Discord setup
 
 The app uses Discord's local RPC (the same mechanism Spotify uses to show
-"Listening to…"). RPC's `GET_SELECTED_VOICE_CHANNEL` command is gated by
-the `rpc.voice.read` OAuth scope, so you need to register an "application"
-identity. **This is not a bot** — we don't go anywhere near the Bot tab.
+"Listening to…"). The voice-channel query and the per-user speaking
+events sit behind the `rpc` OAuth scope, which Discord only grants to
+applications it has approved. **This is not a bot** — no bot token, no
+Bot tab, nothing joins the channel.
+
+### Default: the StreamKit identity (no setup)
+
+Discord's own **StreamKit Overlay** (the OBS/XSplit browser source) is an
+approved RPC application, and Mynah can authorize through it the same
+way the StreamKit web page and third-party overlays such as
+[Discover](https://github.com/trigg/Discover) do:
+
+1. Launch the recorder and click **Connect to Discord**.
+2. The Discord desktop app pops an **Authorize** prompt for *StreamKit
+   Overlay* — accept it.
+
+That's it. No developer application, Client ID or Client Secret. The
+authorization code is exchanged at `streamkit.discord.com` (Discord's own
+server), and the resulting access token lives in the **Windows Credential
+Manager** (under `com.github.ba1lly.mynah`). StreamKit tokens have no
+refresh token, so Discord re-shows the Authorize prompt roughly once a
+week.
+
+What you are agreeing to: Mynah presents itself to Discord under
+Discord's StreamKit application identity. Discord has tolerated the
+open-source overlays doing this for years, but it is not a documented
+public API and Discord could stop honouring it at any time. If that
+happens Mynah reports the error and transcription falls back to audio
+diarization (which requires an HF token).
+
+### Alternative: your own Discord application
+
+Only worth it if Discord has approved **your** application for the `rpc`
+scope (for example an older app that was whitelisted). For a freshly
+created application Discord answers `invalid_scope` before the Authorize
+prompt even appears, and no local setting can change that.
 
 1. Open <https://discord.com/developers/applications> → **New Application**.
-   Name it anything (e.g. "My Mynah").
+   Name it anything (e.g. "My Mynah"). Do **not** attach it to a Team —
+   team-owned applications are refused RPC outright.
 2. **OAuth2** tab → **Redirects** → add `http://localhost` → **Save Changes**.
-3. **OAuth2** tab → enable **Public Client** → **Save Changes**. This is
-   what lets the app authenticate with PKCE — **no Client Secret is
-   needed, asked for, or stored**.
-4. **OAuth2** tab → copy the **Client ID**.
-5. The `rpc` scope is restricted by Discord, so add yourself as a tester:
-   - **App Testers** tab (if it appears on your application) → add your own
-     Discord user.
-   - If you don't see this tab, the `AUTHORIZE` step on first connect may
-     return "RPC is not approved" — Discord's gating policy varies per
-     account/app age. If that happens, the app will report it clearly.
-6. Launch the recorder, open **Settings** (gear icon, top right), paste
-   the Client ID, click **Save**.
+3. **OAuth2** tab → turn **Public Client** off → **Save Changes**. Copy the
+   **Client ID**, then click **Reset Secret** and copy the new **Client
+   Secret**. Treat the secret like a password; do not post it in logs or chat.
+4. If an **App Testers** tab appears on your application, add your own
+   Discord user there.
+5. In Mynah, open **Settings** (gear icon, top right), set **Connect as**
+   to *My own Discord application*, paste the Client ID and Client Secret,
+   then click **Save**.
 
-The first time you click **Connect to Discord**, the Discord desktop app
-will pop an **Authorize** prompt — accept it. The resulting access/refresh
-token is stored in the **Windows Credential Manager** (under
-`com.github.ba1lly.mynah`) and refreshed
-automatically; you only do this once. The HF Token (if you add one)
-goes to the same place — none of the secrets are written to
-`config.json` on disk.
+Tokens, the Client Secret and the HF token all go to the Windows
+Credential Manager — none of the secrets are written to `config.json`.
+Mynah never requests the partner-only `rpc.voice.read` scope; the
+speaking events it needs are covered by `rpc`.
 
 ---
 
@@ -372,15 +399,16 @@ Your PC
 │     └── exposes \\.\pipe\discord-ipc-{0..9}   ← local Windows named pipe
 │
 └── Mynah
-       ├── rpc.py    — connects to the local pipe, does the OAuth handshake
-       │              (PKCE, S256 — no client secret) +
+       ├── rpc.py    — connects to the local pipe, does the OAuth handshake +
        │              AUTHORIZE/AUTHENTICATE, polls GET_SELECTED_VOICE_CHANNEL
        │              every 2s, AND subscribes to SPEAKING_START/SPEAKING_STOP
        │              for the active voice channel. A background reader thread
        │              dispatches each pipe frame either to a pending sync
        │              command (matched by nonce) or to event listeners
-       │              (matched by evt name). Only network call: token
-       │              exchange to discord.com/api/oauth2/token (HTTPS).
+       │              (matched by evt name). Only network call: the OAuth
+       │              code exchange — streamkit.discord.com/overlay/token in
+       │              the default StreamKit mode, discord.com/api/oauth2/token
+       │              for your own application (both HTTPS).
        │
        ├── audio.py  — opens the default mic + a WASAPI loopback (default
        │              Windows playback device unless the user picked one in
@@ -464,19 +492,29 @@ WhisperX is installed from GitHub, which needs `git` on PATH. Install from
 Make sure the Discord desktop client (not the browser) is running. The
 in-browser Discord doesn't expose RPC.
 
-### "Discord rejected the PKCE token exchange (invalid_client)"
+### "Discord rejected the OAuth token exchange (invalid_client)"
 
-Your application doesn't have **Public Client** enabled. Open
-<https://discord.com/developers/applications> → your app → **OAuth2**
-tab → toggle **Public Client** on → **Save Changes**, then click
-**Connect to Discord** again.
+Only in the own-application mode. The Client ID or Client Secret is
+incorrect. Open <https://discord.com/developers/applications> → your app
+→ **OAuth2**, reset/copy the secret, save both values in Mynah Settings,
+then connect again — or switch **Settings → Connect as** to the StreamKit
+identity, which needs neither value.
+
+### "Discord's StreamKit token service rejected the authorization code"
+
+Only in the StreamKit mode. The Authorize prompt was accepted but
+`streamkit.discord.com` refused to turn the code into a token. Usually
+transient — connect again. If it keeps failing, Discord has changed the
+StreamKit flow; check for a Mynah update.
 
 ### "RPC is not approved" / `AUTHORIZE` rejected
 
-Discord restricts the `rpc` scope. Add yourself to the **App Testers** tab
-of your application in the developer portal. If your application doesn't
-show that tab, this scope may simply not be granted for your account —
-unfortunately Discord's policy here varies and isn't documented.
+Only in the own-application mode (`invalid_scope` from `AUTHORIZE`).
+Discord restricts the `rpc` scope to approved applications, and a newly
+created application is refused before the Authorize prompt even appears.
+Try the **App Testers** tab of your application in the developer portal
+if it exists; otherwise switch **Settings → Connect as** to the StreamKit
+identity, which is the default for exactly this reason.
 
 ### "No participants found"
 
@@ -561,8 +599,8 @@ project folder (when running from `start.ps1` / `run.py`) or next to
 
 | Path | What |
 |---|---|
-| `.\config.json` | Non-sensitive settings only: Client ID, audio source, loopback device choice, whisper model, recordings folder. **No secrets.** |
-| Windows Credential Manager, service `com.github.ba1lly.mynah` | HF token and cached OAuth access/refresh tokens — see Settings → Save to populate, or Control Panel → Credential Manager → Windows Credentials to audit. (Older versions also stored a Discord Client Secret here; the PKCE flow no longer uses one, and the app removes the stale entry on launch.) |
+| `.\config.json` | Non-sensitive settings only: Discord identity mode, Client ID, audio source, loopback device choice, whisper model, recordings folder. **No secrets.** |
+| Windows Credential Manager, service `com.github.ba1lly.mynah` | Discord Client Secret (own-application mode only), HF token, and the cached OAuth access/refresh token — see Settings → Save to populate, or Control Panel → Credential Manager → Windows Credentials to audit. |
 | `.\Recordings\` | All `.wav`, `.json`, `.txt` outputs (configurable in Settings) |
 | `.\.venv\` | Python virtual environment (dev mode only) |
 | `.\dist\Mynah\` | Built standalone application (after `start.ps1 -Build`); contains its own (non-secret) `config.json` + `Recordings\` |
@@ -574,8 +612,10 @@ project folder (when running from `start.ps1` / `run.py`) or next to
 ## Privacy & legal
 
 - All audio capture and transcription is local. Nothing is uploaded.
-- Outbound network traffic, exhaustively: the OAuth token exchange with
-  `discord.com/api/oauth2/token` (HTTPS), model-weight downloads on
+- Outbound network traffic, exhaustively: the OAuth code-for-token
+  exchange with Discord — `streamkit.discord.com/overlay/token` in the
+  default StreamKit mode, `discord.com/api/oauth2/token` when using your
+  own application (HTTPS either way) — model-weight downloads on
   first transcription from `huggingface.co`, and — if you leave
   **Settings → Check for updates** enabled (default) — one request per
   launch to GitHub's releases API to see whether a newer version

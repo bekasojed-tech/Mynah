@@ -150,14 +150,23 @@
     <div class="modal-body">
       <div class="form-section">
         <div class="form-section-title">
-          Discord application
-          <a href="#" id="link-portal">Open Developer Portal ↗</a>
+          Discord connection
+          <a href="#" id="link-portal" hidden>Open Developer Portal ↗</a>
         </div>
-        <label class="field-label" for="set-client-id">Client ID</label>
-        <input class="input" id="set-client-id" type="text" autocomplete="off" spellcheck="false">
-        <p class="hint">No Client Secret needed — the app authenticates with
-        PKCE. Enable <strong>Public Client</strong> on your application's
-        OAuth2 tab.</p>
+        <label class="field-label" for="set-auth-mode">Connect as</label>
+        <select class="input" id="set-auth-mode"></select>
+        <p class="hint" id="hint-streamkit">Authorizes through Discord's own StreamKit Overlay
+        application, which Discord has approved for RPC. No developer application,
+        Client ID or Secret needed. Discord may ask you to re-authorize about once a week.</p>
+        <div id="own-app-fields" hidden>
+          <label class="field-label" for="set-client-id">Client ID</label>
+          <input class="input" id="set-client-id" type="text" autocomplete="off" spellcheck="false">
+          <label class="field-label" for="set-client-secret">Client Secret</label>
+          <input class="input" id="set-client-secret" type="password" autocomplete="off" spellcheck="false">
+          <p class="hint">Stored in Windows Credential Manager, not config.json.
+          Find it on your application's OAuth2 page. Only works if Discord has
+          approved your application for the <code>rpc</code> scope.</p>
+        </div>
       </div>
       <div class="form-section">
         <div class="form-section-title">Transcription</div>

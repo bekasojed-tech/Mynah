@@ -35,6 +35,19 @@ log = logging.getLogger(__name__)
 _VALID_AUDIO_SOURCES = {"mixed", "mic_only", "system_only"}
 _DEFAULT_WHISPER_MODEL = "large-v3-turbo"
 
+# How Mynah identifies itself to Discord's local RPC server.
+#   "streamkit": authorize as Discord's own StreamKit Overlay application
+#                (approved for RPC; no developer application needed).
+#   "own_app":   authorize as the user's own developer application using
+#                the Client ID + Client Secret from Settings. Only works
+#                if Discord has approved that application for RPC.
+# Kept as plain strings here (rather than importing from rpc.py) so the
+# config module stays free of pywin32/requests imports.
+AUTH_MODE_STREAMKIT = "streamkit"
+AUTH_MODE_OWN_APP = "own_app"
+_VALID_AUTH_MODES = {AUTH_MODE_STREAMKIT, AUTH_MODE_OWN_APP}
+_DEFAULT_AUTH_MODE = AUTH_MODE_STREAMKIT
+
 # JSON keys that historically held live credentials. We still recognise
 # them in `Config.load()` for migration purposes — they are read out,
 # moved into the OS credential store, and stripped from the saved JSON
@@ -42,10 +55,8 @@ _DEFAULT_WHISPER_MODEL = "large-v3-turbo"
 # truth for the .bad-backup secret-scrubber and the start.ps1 -Build
 # dist-config keep-list assertion.
 _SECRET_FIELDS = frozenset({
-    # discord_client_secret is no longer used (PKCE, issue #1) but stays
-    # in this set so the .bad-backup scrubber keeps redacting it from
-    # legacy configs and the start.ps1 keep-list assertion keeps
-    # rejecting it from dist configs.
+    # The Client Secret is used by the legacy local-RPC OAuth exchange,
+    # but must never be included in normal config.json or build output.
     "discord_client_secret",
     "hf_token",
     "token",
@@ -61,6 +72,7 @@ _SECRET_FIELDS = frozenset({
 # IDE-discoverable, and the dataclass field definitions reference this
 # set in a class-body sanity check at import time.
 _SHADOW_FIELDS = frozenset({
+    "_legacy_client_secret",
     "_legacy_hf_token",
     "_legacy_token",
 })
@@ -152,33 +164,11 @@ def _scrub_and_backup_corrupted_config(
         log.warning("Could not move corrupted config aside: %s", e)
 
 
-def _drop_legacy_client_secret() -> None:
-    """One-time cleanup for the PKCE migration (issue #1).
-
-    Pre-PKCE versions stored the Discord Client Secret in the OS
-    credential store. The secret is no longer used anywhere — keeping
-    it readable by any same-user process is pure attack surface, so
-    delete it on sight. Cheap no-op once gone (get returns None).
-    """
-    try:
-        if secrets_store.get_secret(secrets_store.KEY_DISCORD_CLIENT_SECRET):
-            secrets_store.delete_secret(secrets_store.KEY_DISCORD_CLIENT_SECRET)
-            log.info(
-                "Removed stored Discord Client Secret: no longer needed — "
-                "the app now uses PKCE (no secret required)."
-            )
-    except secrets_store.SecretWriteError as e:
-        log.warning(
-            "Could not remove the obsolete Discord Client Secret from the "
-            "OS credential store (%s); you can delete it manually via "
-            "Credential Manager.", e,
-        )
-
-
 def _migrate_legacy_secrets(
     cfg: "Config",
     legacy_hf_token: str,
     legacy_token_obj: Optional["OAuthToken"],
+    legacy_client_secret: str = "",
 ) -> tuple[list[tuple[str, str, object]], bool]:
     """Lift legacy plaintext secrets through Config setters into the OS
     credential store.
@@ -203,6 +193,18 @@ def _migrate_legacy_secrets(
     migrated: list[tuple[str, str, object]] = []
     any_failure = False
 
+    if legacy_client_secret:
+        try:
+            cfg.discord_client_secret = legacy_client_secret
+            migrated.append((
+                secrets_store.KEY_DISCORD_CLIENT_SECRET,
+                "_legacy_client_secret",
+                legacy_client_secret,
+            ))
+        except secrets_store.SecretWriteError as e:
+            log.error("Migration of Discord Client Secret failed: %s", e)
+            cfg._legacy_client_secret = legacy_client_secret
+            any_failure = True
     if legacy_hf_token:
         try:
             cfg.hf_token = legacy_hf_token
@@ -255,11 +257,14 @@ class Config:
 
     Direct attribute access to the secret properties looks identical
     to the pre-#14 API — `cfg.hf_token`, `cfg.token` — so call sites
-    need not change. (`discord_client_secret` was removed in the PKCE
-    migration, issue #1.)
+    need not change.
     """
 
     discord_client_id: str = ""
+    # See AUTH_MODE_* above. New installs default to the StreamKit
+    # identity; `load()` keeps pre-existing installs that already carry
+    # a Client ID on the own-application flow (see `_AUTH_MODE_UNSET`).
+    discord_auth_mode: str = _DEFAULT_AUTH_MODE
     recordings_dir: str = field(default_factory=lambda: str(DEFAULT_RECORDINGS_DIR))
     whisper_model: str = _DEFAULT_WHISPER_MODEL
     audio_source: str = "mixed"  # one of: "mixed" | "mic_only" | "system_only"
@@ -286,6 +291,7 @@ class Config:
     # for the secrets — `save()` writes them back to config.json with a
     # loud warning so the operator knows credentials are at rest in
     # cleartext.
+    _legacy_client_secret: str = field(default="", repr=False)
     _legacy_hf_token: str = field(default="", repr=False)
     _legacy_token: Optional[OAuthToken] = field(default=None, repr=False)
 
@@ -297,10 +303,46 @@ class Config:
             self.audio_source = "mixed"
         if not self.whisper_model or not isinstance(self.whisper_model, str):
             self.whisper_model = _DEFAULT_WHISPER_MODEL
+        if self.discord_auth_mode not in _VALID_AUTH_MODES:
+            log.warning(
+                "Invalid discord_auth_mode %r; falling back to %r",
+                self.discord_auth_mode, _DEFAULT_AUTH_MODE,
+            )
+            self.discord_auth_mode = _DEFAULT_AUTH_MODE
+
+    @property
+    def uses_streamkit(self) -> bool:
+        return self.discord_auth_mode == AUTH_MODE_STREAMKIT
+
+    def discord_is_configured(self) -> bool:
+        """True when Connect can be attempted with the current settings.
+
+        The StreamKit identity needs nothing from the user; the
+        own-application flow needs both halves of the credentials.
+        """
+        if self.uses_streamkit:
+            return True
+        return bool(self.discord_client_id and self.discord_client_secret)
 
     # ---- secret accessors ----------------------------------------------------
-    # (discord_client_secret was removed in the PKCE migration, issue #1 —
-    # the OAuth flow no longer uses a secret at all.)
+    @property
+    def discord_client_secret(self) -> str:
+        stored = secrets_store.get_secret(
+            secrets_store.KEY_DISCORD_CLIENT_SECRET,
+        )
+        if stored is not None:
+            return stored
+        return self._legacy_client_secret
+
+    @discord_client_secret.setter
+    def discord_client_secret(self, value: str) -> None:
+        value = value or ""
+        if secrets_store.set_secret(
+            secrets_store.KEY_DISCORD_CLIENT_SECRET, value,
+        ):
+            self._legacy_client_secret = ""
+        else:
+            self._legacy_client_secret = value
 
     @property
     def hf_token(self) -> str:
@@ -375,6 +417,8 @@ class Config:
         cls,
         *,
         discord_client_id: str = "",
+        discord_client_secret: str = "",
+        discord_auth_mode: str = _DEFAULT_AUTH_MODE,
         recordings_dir: Optional[str] = None,
         whisper_model: str = _DEFAULT_WHISPER_MODEL,
         audio_source: str = "mixed",
@@ -401,12 +445,15 @@ class Config:
         """
         cfg = cls(
             discord_client_id=discord_client_id,
+            discord_auth_mode=discord_auth_mode,
             recordings_dir=(
                 recordings_dir or str(DEFAULT_RECORDINGS_DIR)
             ),
             whisper_model=whisper_model,
             audio_source=audio_source,
         )
+        if discord_client_secret:
+            cfg.discord_client_secret = discord_client_secret
         if hf_token:
             cfg.hf_token = hf_token
         if token is not None:
@@ -415,11 +462,6 @@ class Config:
 
     @classmethod
     def load(cls) -> "Config":
-        # PKCE migration (issue #1): a Client Secret stored by a pre-PKCE
-        # version is dead weight in the credential store — remove it
-        # unconditionally, including on the fresh-config paths below.
-        _drop_legacy_client_secret()
-
         if not CONFIG_PATH.exists():
             cfg = cls()
             cfg.save()
@@ -458,14 +500,10 @@ class Config:
         # Lift any legacy secrets out of the JSON BEFORE constructing the
         # Config so they never appear as dataclass fields. The HF token
         # and OAuth token are migrated into the OS credential store (or
-        # held in the `_legacy_*` shadows as a fallback); a plaintext
-        # Client Secret from a pre-PKCE config is simply discarded —
-        # the OAuth flow no longer uses one (issue #1).
-        if raw.pop("discord_client_secret", None):
-            log.info(
-                "Dropping discord_client_secret from config.json: the app "
-                "now authenticates with PKCE and needs no Client Secret."
-            )
+        # held in the `_legacy_*` shadows as a fallback).
+        legacy_client_secret = str(
+            raw.pop("discord_client_secret", "") or ""
+        )
         legacy_hf_token = str(raw.pop("hf_token", "") or "")
         legacy_token_raw = raw.pop("token", None)
 
@@ -478,6 +516,13 @@ class Config:
         known = {f.name for f in fields(cls)
                  if f.name not in _SHADOW_FIELDS}
         accepted = {k: v for k, v in raw.items() if k in known}
+        # A config written before the auth-mode setting existed belongs
+        # to someone who set up their own developer application. Keep
+        # them on that flow rather than silently switching identities;
+        # they can pick StreamKit in Settings. Configs without a Client
+        # ID have nothing to preserve and get the new default.
+        if "discord_auth_mode" not in accepted and accepted.get("discord_client_id"):
+            accepted["discord_auth_mode"] = AUTH_MODE_OWN_APP
         dropped = set(raw) - accepted.keys()
         if dropped:
             log.warning("Ignoring unknown config keys: %s", sorted(dropped))
@@ -516,6 +561,7 @@ class Config:
             cfg,
             legacy_hf_token,
             legacy_token_obj,
+            legacy_client_secret,
         )
         any_migrated = bool(migrated_writes)
 
@@ -650,6 +696,8 @@ class Config:
         }
         if self._legacy_hf_token:
             d["hf_token"] = self._legacy_hf_token
+        if self._legacy_client_secret:
+            d["discord_client_secret"] = self._legacy_client_secret
         # only persist a legacy token that has a
         # meaningful access_token. The setter accepts any OAuthToken
         # (even one with empty strings — invalid in practice but

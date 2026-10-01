@@ -349,8 +349,11 @@ async function openSettings() {
   const v = cfg.values;
   const o = cfg.options;
 
+  fillSelect($("#set-auth-mode"), o.auth_modes, v.discord_auth_mode);
   $("#set-client-id").value = v.discord_client_id;
+  $("#set-client-secret").value = v.discord_client_secret;
   $("#set-hf-token").value = v.hf_token;
+  applyAuthModeVisibility();
 
   fillSelect($("#set-model"), o.whisper_models.map((m) => ({ value: m, label: m })), v.whisper_model);
   fillSelect($("#set-source"), o.audio_sources, v.audio_source);
@@ -370,7 +373,16 @@ async function openSettings() {
   $("#set-check-updates").checked = !!v.check_updates;
   $("#settings-error").hidden = true;
   $("#overlay-settings").hidden = false;
-  $("#set-client-id").focus();
+  $("#set-auth-mode").focus();
+}
+
+/* The Client ID / Secret fields and the Developer Portal link only matter
+   for the own-application flow; the StreamKit identity needs none of it. */
+function applyAuthModeVisibility() {
+  const ownApp = $("#set-auth-mode").value === "own_app";
+  $("#own-app-fields").hidden = !ownApp;
+  $("#link-portal").hidden = !ownApp;
+  $("#hint-streamkit").hidden = ownApp;
 }
 
 function fillSelect(sel, options, selected) {
@@ -386,7 +398,9 @@ function fillSelect(sel, options, selected) {
 
 async function saveSettings() {
   const values = {
+    discord_auth_mode: $("#set-auth-mode").value,
     discord_client_id: $("#set-client-id").value,
+    discord_client_secret: $("#set-client-secret").value,
     hf_token: $("#set-hf-token").value,
     whisper_model: $("#set-model").value,
     audio_source: $("#set-source").value,
@@ -410,7 +424,7 @@ async function saveSettings() {
 async function doConnect() {
   const res = await api().connect();
   if (!res.ok && res.error === "not_configured") {
-    toast("Set your Discord Client ID first.", "err");
+    toast("Set your Discord Client ID and Client Secret first, or switch to the StreamKit identity.", "err");
     openSettings();
   } else if (!res.ok) {
     toast(res.error, "err");
@@ -465,6 +479,7 @@ async function init() {
     const path = await api().pick_folder();
     if (path) $("#set-recdir").value = path;
   });
+  $("#set-auth-mode").addEventListener("change", applyAuthModeVisibility);
   $("#link-portal").addEventListener("click", (e) => {
     e.preventDefault();
     api().open_url("developer_portal");
