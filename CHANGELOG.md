@@ -8,6 +8,23 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **One folder per recording.** New recordings are saved as
+  `Recordings\<meeting>_discord_<date>_<time> [<server> - <channel>]\`
+  containing `audio.wav`, `participants.json`, and later `transcript.txt`
+  / `mapping.json`, instead of four prefixed files side by side. The
+  server and channel names are taken from Discord automatically (`[DM]`
+  / `[Group DM - …]` for direct calls) and also recorded in
+  `participants.json`; the Archive shows them as a tag on each row.
+  Recordings made by earlier versions stay listed and transcribable
+  where they are.
+- **Rename recordings from the Archive.** Double-click a name (or click
+  the pencil on the row) to edit the meeting name inline; Enter saves,
+  Escape cancels. The date part is kept so ordering does not change.
+  Names go through the same filename sanitiser as new recordings, name
+  collisions are refused, and renaming is blocked while a transcription
+  is running. Renaming an old flat-layout recording moves its files into
+  a folder. The legacy Tk UI gets a **Rename…** button for the same.
+
 - **StreamKit identity (default for new installs).** Discord now refuses
   the `rpc` OAuth scope for ordinary developer applications
   (`invalid_scope` before the Authorize prompt even appears), which made

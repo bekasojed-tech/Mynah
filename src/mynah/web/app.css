@@ -566,6 +566,37 @@ select.input { cursor: pointer; }
   color: var(--faint);
   white-space: nowrap;
 }
+.rec-row .rec-ctx {
+  flex: none;
+  max-width: 38%;
+  font-size: 11px;
+  color: var(--faint);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 1px 6px;
+  border: 1px solid var(--line-soft);
+  border-radius: 999px;
+}
+/* Rename affordance: hidden until the row is hovered or selected, so the
+   list stays quiet. */
+.rec-row .rec-edit-btn {
+  flex: none;
+  opacity: 0;
+  transition: opacity 0.1s;
+}
+.rec-row:hover .rec-edit-btn,
+.rec-row.sel .rec-edit-btn,
+.rec-row .rec-edit-btn:focus-visible { opacity: 1; }
+.iconbtn.xs { width: 22px; height: 22px; padding: 3px; }
+.iconbtn.xs svg { width: 14px; height: 14px; }
+.rec-row .rec-rename {
+  flex: 1;
+  min-width: 0;
+  padding: 2px 6px;
+  font-size: 13px;
+  line-height: 1.3;
+}
 
 .archive-foot {
   display: flex;

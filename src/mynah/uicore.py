@@ -11,9 +11,10 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import NamedTuple, Optional
 
 from . import secrets_store
 from .config import AUTH_MODE_OWN_APP, AUTH_MODE_STREAMKIT, Config
@@ -259,60 +260,329 @@ def build_consent_record(identity: Optional[dict]) -> dict:
     return record
 
 
-def format_recording_label(path: Path) -> str:
-    """Build a human-friendly display string for a recording WAV.
+# ---- recording layout --------------------------------------------------------
+# Every recording lives in its own folder under the recordings root:
+#
+#   Recordings/<meeting>_discord_YYYYMMDD_HHMMSS/
+#       audio.wav           channel-split capture
+#       participants.json   roster, join/leave + speaking-event timeline
+#       transcript.txt      written by Transcribe
+#       mapping.json        written only when speakers could not be auto-mapped
+#
+# Recordings made before this layout are flat files side by side in the
+# root (`<base>_audio.wav`, `<base>_participants.json`,
+# `<base>_audio_transcript.txt`, `<base>_audio_mapping.json`). They stay
+# listed and transcribable in place; renaming one moves it into a folder.
 
-    Examples of the underlying filename:
-      MEP Landing Page Call_discord_20260528_003930_audio.wav
-      discord_20260525_210051_audio.wav  (no meeting name)
+AUDIO_FILENAME = "audio.wav"
+PARTICIPANTS_FILENAME = "participants.json"
+TRANSCRIPT_FILENAME = "transcript.txt"
+MAPPING_FILENAME = "mapping.json"
 
-    Result: "MEP Landing Page Call  --  2026-05-28 00:39"
+_LEGACY_AUDIO_SUFFIX = "_audio.wav"
+# "<meeting>_discord_YYYYMMDD_HHMMSS" or "discord_YYYYMMDD_HHMMSS", optionally
+# followed by " [<server> - <channel>]" — the where-it-happened context the
+# recorder appends automatically. The context sits AFTER the timestamp in a
+# bracketed block so the user-editable meeting part stays unambiguous.
+_RECORDING_BASE_RE = re.compile(
+    r"^(?:(?P<meeting>.+)_)?discord_(?P<ts>\d{8}_\d{6})(?: \[(?P<context>[^\[\]]+)\])?$"
+)
+# Context parts may not contain the brackets that delimit the block.
+_CONTEXT_SAFE = re.compile(r"[A-Za-z0-9 _\-.()&',!]")
+_CONTEXT_PART_MAX = 40
+
+# Discord channel types relevant to voice (see Discord's channel object).
+CHANNEL_TYPE_DM = 1
+CHANNEL_TYPE_GROUP_DM = 3
+
+# Names this could legitimately produce a Windows path-safe filename
+# component from. Anything outside this set is collapsed to '_'. We also
+# reject the small set of Windows reserved device names case-insensitively.
+_FILENAME_SAFE = re.compile(r"[A-Za-z0-9 _\-.()\[\]]")
+_WINDOWS_RESERVED = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+
+
+def _sanitize_meeting_name(raw: Optional[str]) -> Optional[str]:
+    """Coerce a free-text meeting name into a Windows-safe filename component.
+
+    - Drops every character that is not in a small allow-list (letters,
+      digits, space, `_`, `-`, `.`, parens, square brackets).
+    - Collapses runs of whitespace/underscores.
+    - Strips leading/trailing whitespace, dots, and underscores (Explorer
+      treats trailing dots/spaces specially on Windows).
+    - Rejects Windows reserved device names (CON, NUL, COM1, LPT1, …) by
+      returning None so the recorder falls back to the unprefixed default.
+    - Caps at 64 chars to leave room for the timestamp suffix.
+
+    Without this, `meeting_name = "../../evil"` from the GUI would let an
+    attacker (or an unlucky paste) steer the recording folder outside the
+    configured recordings directory.
     """
-    stem = path.stem  # strip .wav
+    if not raw:
+        return None
+    cleaned_chars = [c if _FILENAME_SAFE.match(c) else "_" for c in raw]
+    cleaned = "".join(cleaned_chars)
+    # Collapse runs of "_" / whitespace introduced by the substitution.
+    cleaned = re.sub(r"[_\s]+", "_", cleaned).strip("._ ")
+    cleaned = cleaned[:64].strip("._ ")
+    if not cleaned:
+        return None
+    # Windows treats reserved device basenames specially EVEN WITH
+    # extensions: "CON.txt", "NUL.log", "COM1.tar.gz" all refer to the
+    # device, not a file. Check the stem before the first dot, not the
+    # whole cleaned string, against the reserved set.
+    head = cleaned.split(".", 1)[0]
+    if head.upper() in _WINDOWS_RESERVED:
+        return None
+    return cleaned
+
+
+def _clean_context_part(raw: object, limit: int = _CONTEXT_PART_MAX) -> str:
+    """Server / channel names are user-controlled Discord strings. Keep a
+    conservative character set (no brackets, no path separators), collapse
+    whitespace, and cap the length so the folder name stays reasonable."""
+    if not raw:
+        return ""
+    cleaned = "".join(c if _CONTEXT_SAFE.match(c) else " " for c in str(raw))
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ._")
+    return cleaned[:limit].strip(" ._")
+
+
+def recording_context(
+    guild_name: Optional[str],
+    channel_name: Optional[str],
+    channel_type: Optional[int] = None,
+) -> Optional[str]:
+    """The " [...]" block content describing where a call happened.
+
+      server voice channel  -> "<server> - <channel>"
+      direct call           -> "DM"
+      group call            -> "Group DM - <name>" (or just "Group DM")
+
+    None when nothing usable is known, so the folder name stays bare.
+    """
+    if channel_type == CHANNEL_TYPE_DM:
+        return "DM"
+    channel = _clean_context_part(channel_name)
+    if channel_type == CHANNEL_TYPE_GROUP_DM:
+        return f"Group DM - {channel}" if channel else "Group DM"
+    server = _clean_context_part(guild_name)
+    parts = [p for p in (server, channel) if p]
+    return " - ".join(parts) or None
+
+
+def recording_base_name(
+    meeting: Optional[str], ts: str, context: Optional[str] = None
+) -> str:
+    """Folder name for a session: `[<meeting>_]discord_<ts>[ [<context>]]`."""
+    base = f"{meeting}_discord_{ts}" if meeting else f"discord_{ts}"
+    if context:
+        base += f" [{context}]"
+    return base
+
+
+class ParsedRecordingName(NamedTuple):
+    meeting: Optional[str]
+    ts: str
+    context: Optional[str]
+
+
+def parse_recording_base(base: str) -> ParsedRecordingName:
+    """Split a base name into (meeting or None, timestamp or "", context or None).
+
+    Unrecognised names come back as (base, "", None) so they still get a label.
+    """
+    m = _RECORDING_BASE_RE.match(base)
+    if not m:
+        return ParsedRecordingName(base or None, "", None)
+    return ParsedRecordingName(m.group("meeting"), m.group("ts"), m.group("context"))
+
+
+def is_folder_layout(audio_path: Path) -> bool:
+    return Path(audio_path).name == AUDIO_FILENAME
+
+
+def recording_base(audio_path: Path) -> str:
+    """The session's base name: the folder name in the folder layout, the
+    `_audio.wav`-stripped stem for a legacy flat recording."""
+    audio_path = Path(audio_path)
+    if is_folder_layout(audio_path):
+        return audio_path.parent.name
+    stem = audio_path.stem
     if stem.endswith("_audio"):
         stem = stem[: -len("_audio")]
-    # Recorder names files one of:
-    #   "<meeting>_discord_YYYYMMDD_HHMMSS"   (custom meeting name)
-    #   "discord_YYYYMMDD_HHMMSS"             (no meeting name)
-    meeting = "Untitled"
-    ts_str = ""
-    if "_discord_" in stem:
-        head, _, ts_str = stem.rpartition("_discord_")
-        meeting = head or "Untitled"
-    elif stem.startswith("discord_"):
-        ts_str = stem[len("discord_"):]
-    else:
-        meeting = stem  # unrecognised pattern; fall back to whole stem
+    return stem
 
+
+@dataclass(frozen=True)
+class RecordingFiles:
+    audio: Path
+    participants: Path
+    transcript: Path
+    mapping: Path
+    # The recording's own folder; None for a legacy flat recording.
+    folder: Optional[Path]
+
+
+def recording_files(audio_path: Path) -> RecordingFiles:
+    """Resolve every file that belongs to the recording `audio_path` is
+    part of, in whichever layout it uses."""
+    audio_path = Path(audio_path)
+    parent = audio_path.parent
+    if is_folder_layout(audio_path):
+        return RecordingFiles(
+            audio=audio_path,
+            participants=parent / PARTICIPANTS_FILENAME,
+            transcript=parent / TRANSCRIPT_FILENAME,
+            mapping=parent / MAPPING_FILENAME,
+            folder=parent,
+        )
+    base = recording_base(audio_path)
+    return RecordingFiles(
+        audio=audio_path,
+        participants=parent / f"{base}_participants.json",
+        transcript=parent / f"{audio_path.stem}_transcript.txt",
+        mapping=parent / f"{audio_path.stem}_mapping.json",
+        folder=None,
+    )
+
+
+def recording_display_parts(audio_path: Path) -> tuple[str, str, str]:
+    """(meeting name or "Untitled", pretty timestamp, context or "") for UI rows."""
+    meeting, ts_str, context = parse_recording_base(recording_base(audio_path))
     if len(ts_str) == 15 and ts_str[8] == "_" and ts_str[:8].isdigit():
         ts_pretty = f"{ts_str[:4]}-{ts_str[4:6]}-{ts_str[6:8]} {ts_str[9:11]}:{ts_str[11:13]}"
     else:
         ts_pretty = ts_str or "?"
+    return _scrub(meeting or "Untitled"), ts_pretty, _scrub(context or "")
+
+
+def format_recording_label(path: Path) -> str:
+    """Build a human-friendly display string for a recording.
+
+    Examples of the underlying name (folder, or legacy flat WAV):
+      MEP Landing Page Call_discord_20260528_003930 [Eunify - general]/audio.wav
+      discord_20260525_210051_audio.wav  (no meeting name, legacy)
+
+    Result: "MEP Landing Page Call  --  2026-05-28 00:39  ·  Eunify - general"
+    """
+    meeting, ts_pretty, context = recording_display_parts(path)
     sep = "—"  # em dash, matching the original Tk label format
-    return f"{_scrub(meeting)}  {sep}  {ts_pretty}"
+    label = f"{meeting}  {sep}  {ts_pretty}"
+    if context:
+        label += f"  ·  {context}"
+    return label
+
+
+def rename_recording(audio_path: Path, new_name: str, recordings_root: Path) -> Path:
+    """Rename the recording `audio_path` belongs to and return its new
+    audio path.
+
+    Only the meeting part of `<meeting>_discord_<ts>` changes; the
+    timestamp is kept so ordering and the date column stay put. The new
+    name goes through the same sanitiser as names typed before a
+    recording, so it cannot escape the recordings folder. An empty or
+    all-unsafe name drops the meeting part (`discord_<ts>`).
+
+    Folder-layout recordings are a single directory rename. Legacy flat
+    recordings are moved into a new folder with the standard file names;
+    a failure mid-move is rolled back so no file is left behind alone.
+
+    Raises ValueError for unrecognised names or paths outside the root,
+    FileExistsError when the target name is taken, and OSError for
+    filesystem failures (e.g. a file still open on Windows).
+    """
+    root = Path(recordings_root).resolve()
+    audio_path = Path(audio_path)
+    resolved = audio_path.resolve()
+    if root not in resolved.parents:
+        raise ValueError("Recording is outside the recordings folder.")
+    old_base = recording_base(audio_path)
+    parsed = parse_recording_base(old_base)
+    if not parsed.ts:
+        raise ValueError(
+            "This recording's name is not in Mynah's format; rename its "
+            "folder in the file manager instead."
+        )
+    # Only the meeting part is the user's to edit; the timestamp and the
+    # server/channel context are facts about the call and travel along.
+    new_base = recording_base_name(
+        _sanitize_meeting_name(new_name), parsed.ts, parsed.context
+    )
+    if new_base == old_base:
+        return audio_path
+    target = root / new_base
+    if target.exists():
+        raise FileExistsError(f"A recording named \"{new_base}\" already exists.")
+
+    files = recording_files(audio_path)
+    if files.folder is not None:
+        files.folder.rename(target)
+        return target / AUDIO_FILENAME
+
+    # Legacy flat layout: gather the set into a folder.
+    target.mkdir()
+    moves = [
+        (files.audio, target / AUDIO_FILENAME),
+        (files.participants, target / PARTICIPANTS_FILENAME),
+        (files.transcript, target / TRANSCRIPT_FILENAME),
+        (files.mapping, target / MAPPING_FILENAME),
+    ]
+    done: list[tuple[Path, Path]] = []
+    try:
+        for src, dst in moves:
+            if src.exists():
+                src.rename(dst)
+                done.append((src, dst))
+    except OSError:
+        for src, dst in reversed(done):
+            try:
+                dst.rename(src)
+            except OSError as rollback_err:
+                log.warning(
+                    "rename_recording: rollback of %s failed (%s)", dst, rollback_err
+                )
+        try:
+            target.rmdir()
+        except OSError:
+            pass
+        raise
+    return target / AUDIO_FILENAME
 
 
 def index_recordings(recordings_path: Path) -> list[tuple[str, Path]]:
     """Scan the recordings folder and return (label, path) pairs, newest
     first, with display labels de-duplicated.
 
-    Only entries that have a participants.json next to them are
-    returned -- otherwise transcription would immediately fail.
+    Both layouts are scanned: one folder per recording (`<base>/audio.wav`)
+    and legacy flat files (`<base>_audio.wav`) in the root. Only entries
+    that have their participants.json are returned -- otherwise
+    transcription would immediately fail.
     """
+    valid: list[Path] = []
     try:
-        wavs = sorted(
-            recordings_path.glob("*_audio.wav"),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
-    except Exception as e:
+        for entry in Path(recordings_path).iterdir():
+            if entry.is_dir():
+                audio = entry / AUDIO_FILENAME
+                if audio.is_file() and (entry / PARTICIPANTS_FILENAME).is_file():
+                    valid.append(audio)
+            elif entry.is_file() and entry.name.endswith(_LEGACY_AUDIO_SUFFIX):
+                if recording_files(entry).participants.is_file():
+                    valid.append(entry)
+    except OSError as e:
         log.warning("Could not list recordings: %s", e)
-        wavs = []
 
-    valid = [
-        p for p in wavs
-        if (p.parent / p.name.replace("_audio.wav", "_participants.json")).exists()
-    ]
+    def _mtime(p: Path) -> float:
+        try:
+            return p.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    valid.sort(key=_mtime, reverse=True)
 
     out: list[tuple[str, Path]] = []
     seen: set[str] = set()

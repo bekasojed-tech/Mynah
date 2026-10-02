@@ -1052,7 +1052,12 @@ def transcribe(
         # below.
         roster = [p["name"] for p in participants_detailed] or initial_participants
 
-        out_path = audio_path.parent / f"{audio_path.stem}_transcript.txt"
+        # transcript.txt inside the recording's folder, or the legacy
+        # `<base>_audio_transcript.txt` beside a flat recording.
+        from .uicore import recording_files
+
+        rec_files = recording_files(audio_path)
+        out_path = rec_files.transcript
         with out_path.open("w", encoding="utf-8") as f:
             # Scrub each roster entry: Discord display names are attacker-
             # controlled and can contain literal newlines or bidi/control
@@ -1082,7 +1087,7 @@ def transcribe(
                     f.write(f"{block_text}\n\n")
 
         if unmapped:
-            mapping_path = audio_path.parent / f"{audio_path.stem}_mapping.json"
+            mapping_path = rec_files.mapping
             # Skip locally-attached segments (is_local_user=True) when
             # building the mapping file: those labels never came from
             # the diarizer's SPEAKER_NN clusters and don't represent a

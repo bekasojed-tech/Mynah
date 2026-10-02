@@ -11,7 +11,7 @@ import tkinter as tk
 import webbrowser
 from dataclasses import asdict
 from pathlib import Path
-from tkinter import filedialog, messagebox, scrolledtext, ttk
+from tkinter import filedialog, messagebox, scrolledtext, simpledialog, ttk
 from typing import Callable, Optional
 
 from . import __version__, secrets_store
@@ -36,6 +36,10 @@ from .uicore import (  # noqa: F401  (re-exports)
     build_consent_record,
     format_recording_label,
     index_recordings,
+    parse_recording_base,
+    recording_base,
+    recording_files,
+    rename_recording,
 )
 
 log = logging.getLogger(__name__)
@@ -411,10 +415,14 @@ class MainWindow:
             tx_frame, text="↻", width=3, command=self._refresh_recordings
         )
         self.refresh_recs_btn.grid(row=0, column=2, padx=(6, 0))
+        self.rename_btn = ttk.Button(
+            tx_frame, text="Rename…", command=self._rename_selected, width=10
+        )
+        self.rename_btn.grid(row=1, column=0, sticky=tk.W, pady=(8, 0))
         self.transcribe_btn = ttk.Button(
             tx_frame, text="Transcribe selected", command=self._transcribe_selected, width=22
         )
-        self.transcribe_btn.grid(row=1, column=0, columnspan=3, sticky=tk.E, pady=(8, 0))
+        self.transcribe_btn.grid(row=1, column=1, columnspan=2, sticky=tk.E, pady=(8, 0))
 
         log_frame = ttk.LabelFrame(self.root, text="Log", padding=6)
         log_frame.pack(fill=tk.BOTH, expand=True, **pad)
@@ -887,15 +895,39 @@ class MainWindow:
                     return
         self.recording_pick.set(labels[0])
 
+    def _rename_selected(self) -> None:
+        label = self.recording_pick.get()
+        audio_path = self._recordings_index.get(label)
+        if audio_path is None:
+            messagebox.showinfo("Rename", "Pick a recording from the dropdown first.")
+            return
+        current = parse_recording_base(recording_base(audio_path))[0] or ""
+        new_name = simpledialog.askstring(
+            "Rename recording",
+            "Meeting name (leave empty for no name; the date is kept):",
+            initialvalue=current,
+            parent=self.root,
+        )
+        if new_name is None:
+            return
+        try:
+            new_audio = rename_recording(
+                audio_path, new_name, self.config.recordings_path
+            )
+        except (OSError, ValueError) as e:
+            messagebox.showerror("Rename", _scrub(str(e)))
+            return
+        log.info("Renamed recording %s -> %s",
+                 recording_base(audio_path), recording_base(new_audio))
+        self._refresh_recordings(select=new_audio)
+
     def _transcribe_selected(self) -> None:
         label = self.recording_pick.get()
         audio_path = self._recordings_index.get(label)
         if audio_path is None:
             messagebox.showinfo("Transcribe", "Pick a recording from the dropdown first.")
             return
-        participants_path = audio_path.parent / audio_path.name.replace(
-            "_audio.wav", "_participants.json"
-        )
+        participants_path = recording_files(audio_path).participants
         if not participants_path.exists():
             messagebox.showerror("Transcribe", f"Missing {participants_path.name}")
             return

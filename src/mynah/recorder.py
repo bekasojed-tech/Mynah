@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -13,54 +12,21 @@ from typing import Optional
 
 from .audio import AudioRecorder
 from .rpc import DiscordRPC
+# The filename sanitiser and the on-disk layout helpers live in uicore so
+# the rename feature (backend + both UIs) shares them without importing
+# the audio stack. Re-exported here because tests and older call sites
+# import `_sanitize_meeting_name` from this module.
+from .uicore import (  # noqa: F401  (re-exports)
+    _FILENAME_SAFE,
+    _WINDOWS_RESERVED,
+    AUDIO_FILENAME,
+    PARTICIPANTS_FILENAME,
+    _sanitize_meeting_name,
+    recording_base_name,
+    recording_context,
+)
 
 log = logging.getLogger(__name__)
-
-
-# Names this could legitimately produce a Windows path-safe filename
-# component from. Anything outside this set is collapsed to '_'. We also
-# reject the small set of Windows reserved device names case-insensitively.
-_FILENAME_SAFE = re.compile(r"[A-Za-z0-9 _\-.()\[\]]")
-_WINDOWS_RESERVED = {
-    "CON", "PRN", "AUX", "NUL",
-    *(f"COM{i}" for i in range(1, 10)),
-    *(f"LPT{i}" for i in range(1, 10)),
-}
-
-
-def _sanitize_meeting_name(raw: Optional[str]) -> Optional[str]:
-    """Coerce a free-text meeting name into a Windows-safe filename component.
-
-    - Drops every character that is not in a small allow-list (letters,
-      digits, space, `_`, `-`, `.`, parens, square brackets).
-    - Collapses runs of whitespace/underscores.
-    - Strips leading/trailing whitespace, dots, and underscores (Explorer
-      treats trailing dots/spaces specially on Windows).
-    - Rejects Windows reserved device names (CON, NUL, COM1, LPT1, …) by
-      returning None so the recorder falls back to the unprefixed default.
-    - Caps at 64 chars to leave room for the timestamp suffix.
-
-    Without this, `meeting_name = "../../evil"` from the GUI would let an
-    attacker (or an unlucky paste) steer the .wav and participants.json
-    outside the configured recordings directory.
-    """
-    if not raw:
-        return None
-    cleaned_chars = [c if _FILENAME_SAFE.match(c) else "_" for c in raw]
-    cleaned = "".join(cleaned_chars)
-    # Collapse runs of "_" / whitespace introduced by the substitution.
-    cleaned = re.sub(r"[_\s]+", "_", cleaned).strip("._ ")
-    cleaned = cleaned[:64].strip("._ ")
-    if not cleaned:
-        return None
-    # Windows treats reserved device basenames specially EVEN WITH
-    # extensions: "CON.txt", "NUL.log", "COM1.tar.gz" all refer to the
-    # device, not a file. Check the stem before the first dot, not the
-    # whole cleaned string, against the reserved set.
-    head = cleaned.split(".", 1)[0]
-    if head.upper() in _WINDOWS_RESERVED:
-        return None
-    return cleaned
 
 
 @dataclass
@@ -121,6 +87,13 @@ class RecordingSession:
         self._speaking_lock = threading.Lock()
         self._speaking_subscribed = False
         self._voice_channel_id: Optional[str] = None
+        # Where the call happened — folded into the folder name and
+        # persisted to participants.json. Server name needs a second RPC
+        # round-trip (GET_GUILD) and is best-effort.
+        self._channel_name: str = ""
+        self._channel_type: Optional[int] = None
+        self._guild_id: Optional[str] = None
+        self._guild_name: str = ""
         self._base_name = ""
 
     def start(self) -> list[str]:
@@ -135,6 +108,14 @@ class RecordingSession:
         self._voice_channel_id = ch.get("id")
         if not self._voice_channel_id:
             raise RuntimeError("Discord returned a voice channel with no id field")
+        self._channel_name = str(ch.get("name") or "")
+        self._channel_type = ch.get("type") if isinstance(ch.get("type"), int) else None
+        guild_id = ch.get("guild_id")
+        self._guild_id = str(guild_id) if guild_id else None
+        self._guild_name = ""
+        if self._guild_id:
+            guild = self.rpc.get_guild(self._guild_id) or {}
+            self._guild_name = str(guild.get("name") or "")
         detailed: list[dict] = []
         for vs in ch.get("voice_states", []):
             user = vs.get("user") or {}
@@ -153,8 +134,11 @@ class RecordingSession:
         self._self_user_id = (self.rpc.identity or {}).get("id")
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        prefix = f"{self.meeting_name}_" if self.meeting_name else ""
-        self._base_name = f"{prefix}discord_{ts}"
+        self._base_name = recording_base_name(
+            self.meeting_name,
+            ts,
+            recording_context(self._guild_name, self._channel_name, self._channel_type),
+        )
         self._events = [
             {
                 "timestamp": 0.0,
@@ -377,7 +361,14 @@ class RecordingSession:
         # timeline are already persisted to disk — the user still has the
         # evidentiary metadata even though the WAV is lost. The previous
         # order discarded both.
-        audio_path = self.output_dir / f"{self._base_name}_audio.wav"
+        #
+        # Each recording gets its own folder named after the session
+        # (`<meeting>_discord_<timestamp>`), holding audio.wav,
+        # participants.json and, later, transcript.txt / mapping.json.
+        # Renaming a recording is then a single folder rename.
+        rec_dir = self.output_dir / self._base_name
+        rec_dir.mkdir(parents=True, exist_ok=True)
+        audio_path = rec_dir / AUDIO_FILENAME
 
         with self._speaking_lock:
             # Only surface speaking events if BOTH subscriptions were live;
@@ -388,7 +379,7 @@ class RecordingSession:
         with self._events_lock:
             events_snapshot = list(self._events)
 
-        participants_path = self.output_dir / f"{self._base_name}_participants.json"
+        participants_path = rec_dir / PARTICIPANTS_FILENAME
         participants_path.write_text(
             json.dumps(
                 {
@@ -396,6 +387,10 @@ class RecordingSession:
                     "participants_detailed": self._participants_detailed,
                     "self_user_id": self._self_user_id,
                     "voice_channel_id": self._voice_channel_id,
+                    "channel_name": self._channel_name,
+                    "channel_type": self._channel_type,
+                    "guild_id": self._guild_id,
+                    "guild_name": self._guild_name,
                     "events": events_snapshot,
                     "speaking_events": speaking_events,
                     "speaking_events_complete": self._speaking_subscribed,

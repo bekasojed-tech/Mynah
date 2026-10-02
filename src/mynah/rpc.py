@@ -1332,6 +1332,17 @@ class DiscordRPC:
 
     # ---- queries ----
 
+    def get_guild(self, guild_id: str) -> Optional[dict]:
+        """GET_GUILD: {id, name, icon_url, ...} for a server the user is in.
+        Used only to label recordings; any failure is non-fatal."""
+        if not self.authenticated or not guild_id:
+            return None
+        try:
+            return self._cmd("GET_GUILD", {"guild_id": str(guild_id), "timeout": 5})
+        except RpcError as e:
+            log.info("GET_GUILD failed (%s); recording will be labelled without server name.", e)
+            return None
+
     def get_voice_channel(self) -> Optional[dict]:
         if not self.authenticated:
             return None

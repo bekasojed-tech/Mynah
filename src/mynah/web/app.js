@@ -10,6 +10,7 @@ const $ = (sel) => document.querySelector(sel);
 const ui = {
   state: null,
   selectedRecording: null,   // path string
+  renaming: null,            // path of the recording whose name is being edited
   pendingSelect: null,       // path to auto-select after next state render
   consentText: null,
   timerHandle: null,
@@ -226,24 +227,47 @@ function renderRecordings(s) {
   }
 
   for (const rec of s.recordings) {
+    const selected = rec.path === ui.selectedRecording;
     const row = document.createElement("div");
-    row.className = "rec-row" + (rec.path === ui.selectedRecording ? " sel" : "");
-    // Backend labels look like "Meeting  —  2026-05-28 00:39"; split for layout.
-    const sep = rec.label.lastIndexOf("  —  ");
-    const name = sep > 0 ? rec.label.slice(0, sep) : rec.label;
-    const date = sep > 0 ? rec.label.slice(sep + 5) : "";
+    row.className = "rec-row" + (selected ? " sel" : "");
     const nameEl = document.createElement("span");
     nameEl.className = "rec-name";
-    nameEl.textContent = name;
-    nameEl.title = rec.label;
+    nameEl.textContent = rec.name || "Untitled";
+    nameEl.title = rec.label + " — double-click to rename";
     const dateEl = document.createElement("span");
     dateEl.className = "rec-date";
-    dateEl.textContent = date;
-    row.append(nameEl, dateEl);
-    row.addEventListener("click", () => {
-      ui.selectedRecording = rec.path;
-      renderRecordings(ui.state);
-    });
+    dateEl.textContent = rec.date || "";
+    // Server / channel the call happened in (recorded automatically).
+    const ctxEl = document.createElement("span");
+    ctxEl.className = "rec-ctx";
+    ctxEl.textContent = rec.context || "";
+    ctxEl.title = rec.context || "";
+    ctxEl.hidden = !rec.context;
+    row.append(nameEl, ctxEl, dateEl);
+
+    if (ui.renaming === rec.path) {
+      row.replaceChildren(buildRenameEditor(rec), ctxEl, dateEl);
+    } else {
+      const editBtn = document.createElement("button");
+      editBtn.className = "iconbtn xs rec-edit-btn";
+      editBtn.title = "Rename";
+      editBtn.setAttribute("aria-label", "Rename recording");
+      editBtn.innerHTML =
+        '<svg viewBox="0 0 20 20"><path d="m13.5 3.5 3 3L7 16H4v-3L13.5 3.5Z" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg>';
+      editBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        startRename(rec);
+      });
+      row.appendChild(editBtn);
+      row.addEventListener("click", () => {
+        ui.selectedRecording = rec.path;
+        renderRecordings(ui.state);
+      });
+      nameEl.addEventListener("dblclick", (e) => {
+        e.stopPropagation();
+        startRename(rec);
+      });
+    }
     list.appendChild(row);
   }
 
@@ -260,6 +284,79 @@ function renderRecordings(s) {
   } else {
     hint.textContent = "";
   }
+}
+
+/* ------------------------------ rename ---------------------------------- */
+
+function startRename(rec) {
+  if (ui.state && ui.state.transcribing) {
+    toast("Wait for the running transcription to finish before renaming.", "err");
+    return;
+  }
+  ui.selectedRecording = rec.path;
+  ui.renaming = rec.path;
+  renderRecordings(ui.state);
+  const input = $("#rec-rename-input");
+  if (input) {
+    input.focus();
+    input.select();
+  }
+}
+
+function cancelRename() {
+  ui.renaming = null;
+  renderRecordings(ui.state);
+}
+
+/* Inline editor that replaces the name span of the row being renamed.
+   Only the meeting part is editable; the backend keeps the timestamp. */
+function buildRenameEditor(rec) {
+  const input = document.createElement("input");
+  input.type = "text";
+  input.id = "rec-rename-input";
+  input.className = "input rec-rename";
+  input.value = rec.meeting || "";
+  input.placeholder = "Meeting name (empty = no name)";
+  input.maxLength = 64;
+  input.spellcheck = false;
+  let finished = false;
+  const commit = async () => {
+    if (finished) return;
+    finished = true;
+    const value = input.value.trim();
+    if (value === (rec.meeting || "")) {
+      cancelRename();
+      return;
+    }
+    // Set before the call: the backend pushes the refreshed state as part
+    // of the rename, and renderRecordings() consumes pendingSelect then.
+    ui.pendingSelect = null;
+    const res = await api().rename_recording(rec.path, value);
+    ui.renaming = null;
+    if (!res.ok) {
+      toast(res.error, "err", 8000);
+      renderRecordings(ui.state);
+      return;
+    }
+    ui.selectedRecording = res.path;
+    renderRecordings(ui.state);
+    toast("Recording renamed.", "ok");
+  };
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      commit();
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      finished = true;
+      cancelRename();
+    }
+  });
+  input.addEventListener("blur", () => {
+    if (!finished) commit();
+  });
+  input.addEventListener("click", (e) => e.stopPropagation());
+  return input;
 }
 
 /* ------------------------------ elapsed timer --------------------------- */

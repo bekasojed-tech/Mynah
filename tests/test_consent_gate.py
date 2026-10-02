@@ -30,6 +30,10 @@ def _session(consent_record):
     sess._participants_detailed = [{"id": "111", "name": "Alice"}]
     sess._self_user_id = "111"
     sess._voice_channel_id = "999"
+    sess._channel_name = "general"
+    sess._channel_type = 2
+    sess._guild_id = "42"
+    sess._guild_name = "Eunify"
     sess._events = []
     sess._events_lock = threading.Lock()
     sess._speaking_events = []
@@ -53,16 +57,22 @@ class TestConsentRecordPersisted:
 
         sess.stop()
 
-        path = tmp_path / "test_participants.json"
+        # Each recording lands in its own folder named after the session.
+        path = tmp_path / "test" / "participants.json"
         data = json.loads(path.read_text(encoding="utf-8"))
         assert data["consent"] == record
+        # Where the call happened is persisted alongside the roster.
+        assert data["guild_name"] == "Eunify"
+        assert data["guild_id"] == "42"
+        assert data["channel_name"] == "general"
+        assert data["channel_type"] == 2
 
     def test_none_consent_persisted_as_null(self, tmp_path):
         sess = _session(None)
         sess.output_dir = tmp_path
         sess._base_name = "test"
         sess.stop()
-        data = json.loads((tmp_path / "test_participants.json").read_text())
+        data = json.loads((tmp_path / "test" / "participants.json").read_text())
         assert data["consent"] is None
         assert "consent" in data
 

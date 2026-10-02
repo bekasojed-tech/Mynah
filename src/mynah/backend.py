@@ -43,6 +43,11 @@ from .uicore import (
     apply_settings_atomically,
     build_consent_record,
     index_recordings,
+    parse_recording_base,
+    recording_base,
+    recording_display_parts,
+    recording_files,
+    rename_recording,
     scrub_multiline,
 )
 
@@ -471,10 +476,21 @@ class MynahBackend:
 
     def _refresh_recordings_index(self) -> None:
         pairs = index_recordings(self._config.recordings_path)
+        rows = []
+        for label, path in pairs:
+            name, date, context = recording_display_parts(path)
+            rows.append({
+                "label": label,
+                "path": str(path),
+                "name": name,
+                "date": date,
+                "context": context,
+                # The raw meeting part (may be empty) — what the rename
+                # editor should prefill, as opposed to the "Untitled" label.
+                "meeting": parse_recording_base(recording_base(path))[0] or "",
+            })
         with self._lock:
-            self._recordings = [
-                {"label": label, "path": str(path)} for label, path in pairs
-            ]
+            self._recordings = rows
 
     # ---- JS API: state ----
 
@@ -727,6 +743,38 @@ class MynahBackend:
         self._emit_state()
         return {"ok": True}
 
+    def rename_recording(self, path_str: str, new_name: str) -> dict:
+        """Rename a recording from the Archive list.
+
+        `new_name` is the meeting part only; the timestamp is kept. The
+        JS side may only name paths from our own scan, mirroring
+        transcribe_recording(). Refused while a transcription runs, since
+        Windows will not rename a folder whose files are open.
+        """
+        with self._lock:
+            known = {r["path"] for r in self._recordings}
+            if path_str not in known:
+                return {"ok": False, "error": "Pick a recording from the list first."}
+            if self._transcribing:
+                return {
+                    "ok": False,
+                    "error": "Wait for the running transcription to finish before renaming.",
+                }
+        try:
+            new_audio = rename_recording(
+                Path(path_str), str(new_name or ""), self._config.recordings_path
+            )
+        except FileExistsError as e:
+            return {"ok": False, "error": _scrub(str(e))}
+        except (OSError, ValueError) as e:
+            log.warning("Rename failed for %s: %s", path_str, e)
+            return {"ok": False, "error": f"Could not rename recording:\n{_scrub(str(e))}"}
+        log.info("Renamed recording %s -> %s", recording_base(Path(path_str)),
+                 recording_base(new_audio))
+        self._refresh_recordings_index()
+        self._emit_state()
+        return {"ok": True, "path": str(new_audio)}
+
     def transcribe_recording(self, path_str: str) -> dict:
         with self._lock:
             known = {r["path"] for r in self._recordings}
@@ -736,9 +784,7 @@ class MynahBackend:
         if path_str not in known:
             return {"ok": False, "error": "Pick a recording from the list first."}
         audio_path = Path(path_str)
-        participants_path = audio_path.parent / audio_path.name.replace(
-            "_audio.wav", "_participants.json"
-        )
+        participants_path = recording_files(audio_path).participants
         if not participants_path.exists():
             return {"ok": False, "error": f"Missing {participants_path.name}"}
 
